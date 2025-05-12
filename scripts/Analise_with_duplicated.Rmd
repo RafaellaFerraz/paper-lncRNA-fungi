@@ -1,0 +1,669 @@
+---
+title: "Analise_with_duplicated"
+author: "Rafaella Ferraz"
+date: "2025-04-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# libraries
+```{r, echo = T, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tximport)
+library(GenomicFeatures)
+library(DESeq2)
+library(PCAtools)
+library(pheatmap)
+```
+
+
+# Metadata
+```{r, echo=T}
+meta <- data.frame(sample = c("CF760-008L0007", "CF760-008L0008", "CF760-008L0009",
+                              "CF760-008L0010", "CF760-008L0011", "CF760-008L0012"),
+                   condition = c("Pb18_Pbs", "Pb18_Pbs", "Pb18_Pbs", "Hapx_Pbs", "Hapx_Pbs", "Hapx_Pbs"))
+rownames(meta) <- meta$sample
+
+```
+
+# Prepare to tximport
+
+```{r, echo = T}
+## gtf path
+gtf <- "./gtfs/combined_stringtie_ncbi_new_names.gtf"
+## database path
+txdb.filename <- "./Pb_stringtie_ncbi.gtf.sqlite"
+## create database
+if(!("Pb_stringtie_ncbi.gtf.sqlite" %in% list.files("./"))) {
+  txdb <- makeTxDbFromGFF(gtf, format = "gtf")
+  saveDb(txdb, txdb.filename)
+}
+## load database
+txdb <- loadDb(txdb.filename)
+## select genes(GENEID) and trasncripts (TXNAME)
+txdf <- AnnotationDbi::select(txdb, keys(txdb, "GENEID"), "TXNAME", "GENEID")
+tab <- table(txdf$GENEID)
+txdf$ntx <- tab[match(txdf$GENEID, names(tab))]
+## create tx2gene
+tx2gene <- data.frame(tx = txdf$TXNAME, gene = txdf$GENEID, stringsAsFactors = F)
+## files path
+files <- list.files(path = "./pbs_salmon_quant_combined_stringtie_ncbi", pattern = "sf", recursive = TRUE, full.names = TRUE)
+files <- files[base::match(rownames(meta), sapply(strsplit(files, "\\/"), "[[", 3))]
+names(files) <- rownames(meta)
+
+rm(txdf, tab, gtf, txdb, txdb.filename)
+
+```
+
+# Import counts
+```{r, echo = T}
+## Transcript
+txi_tx <- tximport(files = files, type = "salmon", txOut = T)
+head(txi_tx$counts)
+
+## Gene
+txi_gene <- tximport(files = files, type = "salmon", tx2gene = tx2gene)
+head(txi_gene$counts)
+
+```
+
+# Quality Analysis
+# PCA
+```{r, echo = T}
+## Check metadata and colnames from tximport object
+identical(rownames(meta), colnames(txi_gene$counts))
+## Create DESEQ object
+dds <- DESeqDataSetFromTximport(txi_gene, colData = meta, design = ~ condition)
+## Transform
+dds_vst <- vst(dds)
+## Get counts
+counts_genes_vst <- assay(dds_vst)
+## Calculate PCA
+pca_pb18 <- pca(counts_genes_vst, metadata = meta)
+
+## Plot pca
+PCAtools::biplot(pca_pb18, colby = "condition", legendPosition = "left") +
+  ggplot2::theme_minimal()
+
+## components
+PCAtools::screeplot(pca_pb18)
+
+```
+
+## Hierarchical clustering 
+```{r, echo = T}
+
+plot_hier <- function(feature){
+  ## transpose matrix
+  counts_genes_vst_t <- t(counts_genes_vst)
+  # set names
+  rownames(counts_genes_vst_t) <- meta[,feature]
+  # Hierarchical clustering 
+  d <- dist(as.matrix(counts_genes_vst_t), method = "euclidean")
+  clusters <- hclust(d, method = "complete")
+  # Plot
+  return(plot(clusters))
+}
+
+plot_hier("sample")
+plot_hier("condition")
+
+rm(counts_genes_vst, dds, dds_vst, pca_pb18, files, plot_hier)
+```
+
+# Differential Gene expression 
+```{r, echo = T}
+## Separate to lncRNAs and reference
+combined_stringtie_ncbi_new_names <- as.data.frame(rtracklayer::import("./gtfs/combined_stringtie_ncbi_new_names.gtf"))
+
+
+lnc_tx <- combined_stringtie_ncbi_new_names %>% 
+  filter(transcript_biotype == "lncRNA") %>% pull(gene_id) %>% unique()
+pc_tx <- combined_stringtie_ncbi_new_names %>% 
+  filter(transcript_biotype %in% c("mRNA", "rRNA", "tRNA")) %>% pull(gene_id) %>% unique()
+
+txi_lnc <- list(
+  abundance = txi_gene$abundance[rownames(txi_gene$abundance) %in% lnc_tx, ],
+  counts = txi_gene$counts[rownames(txi_gene$counts) %in% lnc_tx, ],
+  length = txi_gene$length[rownames(txi_gene$length) %in% lnc_tx, ],
+  countsFromAbundance = txi_gene$countsFromAbundance
+)
+
+txi_pc <- list(
+  abundance = txi_gene$abundance[rownames(txi_gene$abundance) %in% pc_tx, ],
+  counts = txi_gene$counts[rownames(txi_gene$counts) %in% pc_tx, ],
+  length = txi_gene$length[rownames(txi_gene$length) %in% pc_tx, ],
+  countsFromAbundance = txi_gene$countsFromAbundance
+)
+
+print(paste("Number of lncRNAs (genes):", nrow(txi_lnc$counts)))
+print(paste("Number of others (genes):", nrow(txi_pc$counts)))
+
+dds_lncRNA <- DESeqDataSetFromTximport(txi_lnc,
+                                colData = meta,
+                                design = ~ condition)
+
+dds_pc <- DESeqDataSetFromTximport(txi_pc,
+                                       colData = meta,
+                                       design = ~ condition)
+
+
+dds_lncRNA <- DESeq(dds_lncRNA)
+dds_pc  <- DESeq(dds_pc)
+
+resultsNames(dds_lncRNA)
+resultsNames(dds_pc)
+
+
+```
+
+## Count of HapX gene
+```{r, echo=T}
+
+hapx_count <- as.data.frame(txi_gene$counts) %>% 
+  rownames_to_column("gene") %>% 
+  dplyr::filter(gene == "PADG_07492")
+
+hapx_count <- as.data.frame(t(hapx_count)) %>% 
+  rownames_to_column("sample")
+
+hapx_count <- hapx_count[2:7,]
+colnames(hapx_count)[2] <- "count"
+hapx_count$count <- as.numeric(hapx_count$count)
+
+
+ggplot(hapx_count, aes(x = sample, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Count of the PADG_07492", x = "Amostra", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+## Results (gene level)
+```{r, echo = T}
+#res_lnc <- lfcShrink(dds_lncRNA, coef = "condition_Pb18_Pbs_vs_Hapx_Pbs", type = "apeglm")
+#res_pc  <- lfcShrink(dds_pc,  coef = "condition_Pb18_Pbs_vs_Hapx_Pbs", type = "apeglm")
+
+res_lnc <- DESeq2::results(dds_lncRNA, name = "condition_Pb18_Pbs_vs_Hapx_Pbs")
+res_pc  <- DESeq2::results(dds_pc,  name = "condition_Pb18_Pbs_vs_Hapx_Pbs")
+
+# Transformar em dataframe
+res_dte_lnc <- as.data.frame(res_lnc)
+res_dte_pc <- as.data.frame(res_pc)
+
+
+res_dte_sign <- function(res_dte){
+  res_dte %>% 
+  mutate(
+    signif = 
+      case_when(
+        padj < 0.05 & log2FoldChange < 0 ~ "Downregulated",
+        padj < 0.05 & log2FoldChange > 0 ~ "Upregulated",
+        padj >= 0.05 ~ "Not significant"
+      )
+  )
+} 
+
+
+res_dte_lnc <- res_dte_sign(res_dte_lnc) %>% na.omit()
+res_dte_pc <- res_dte_sign(res_dte_pc) %>% na.omit()
+
+
+write.csv(res_dte_lnc, file = "./results_salmon/res_dte_lnc_gene_level.csv")
+write.csv(res_dte_pc, file = "./results_salmon/res_dte_pc_gene_level.csv")
+
+```
+
+## Differential expression of the PADG_07492
+```{r, echo = T}
+print(res_dte_pc %>% 
+  rownames_to_column("gene") %>% 
+  filter(gene == "PADG_07492"))
+
+```
+
+
+## Number of downregulated and upregulated (gene level)
+```{r, echo = T}
+ggplot(res_dte_lnc %>% filter(signif != "Not significant"), aes(signif)) +
+  geom_bar(aes(fill = signif)) + xlab("") + ylab("Number of lncRNAs (gene)") + theme_minimal()
+
+ggplot(res_dte_pc %>% filter(signif != "Not significant"), aes(signif)) +
+  geom_bar(aes(fill = signif)) + xlab("") + ylab("Number of other RNAs (gene)") + theme_minimal()
+
+```
+
+
+
+## Pheatmap (gene level)
+```{r, echo = T}
+heatm_plot <- function(res_dte, dds_tx){
+  res_dte <- subset(res_dte, padj < 0.05)
+  dgt <- rownames(res_dte)
+  exp_genes_tx <- counts(dds_tx, normalized = TRUE)
+  idx <- rownames(exp_genes_tx) %in% dgt
+  exp_genes_tx <- exp_genes_tx[idx,]
+  exp_dgt_z_score <- t(apply(exp_genes_tx, 1, scale, center = T, scale = T))
+  colnames(exp_dgt_z_score) <- rownames(meta)
+  return(exp_dgt_z_score)
+}
+
+exp_lnc <- heatm_plot(res_dte_lnc, dds_lncRNA)
+exp_pc <- heatm_plot(res_dte_pc, dds_pc)
+
+ann_col <- data.frame(Condition = meta$condition)
+rownames(ann_col) <- meta$sample
+
+# Plotar gráfico
+pheatmap(exp_lnc, show_rownames = F, annotation_col = ann_col, cluster_cols = T)
+grid::grid.text("lncRNAs (gene)", y = 0.98, x = 0.9, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+
+pheatmap(exp_pc, show_rownames = F, annotation_col = ann_col, cluster_cols = T)
+grid::grid.text("Other RNAs (gene)", y = 0.98, x = 0.85, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+
+rm(ann_col, exp_lnc, exp_pc, heatm_plot)
+
+```
+
+
+## Volcano (gene level)
+```{r, echo = T}
+
+EnhancedVolcano::EnhancedVolcano(res_dte_lnc,
+                lab = rownames(res_dte_lnc),
+                x = 'log2FoldChange',
+                y = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 0,
+                pointSize = 2.0,
+                labSize = 3.5,
+                title = 'Volcano Plot - DE lncRNAs',
+                subtitle = 'FDR < 0.05 and |LFC| > 0',
+                caption = "Fonte: DESeq2",
+                legendPosition = 'right', )
+
+
+EnhancedVolcano::EnhancedVolcano(res_dte_pc,
+                                 lab = rownames(res_dte_pc),
+                                 x = 'log2FoldChange',
+                                 y = 'padj',
+                                 pCutoff = 0.05,
+                                 FCcutoff = 0,
+                                 pointSize = 2.0,
+                                 labSize = 3.5,
+                                 title = 'Volcano Plot - DE protein-coding, tRNA, rRNA',
+                                 subtitle = 'FDR < 0.05 and |LFC| > 0',
+                                 caption = "Fonte: DESeq2",
+                                 legendPosition = 'right', )
+
+```
+
+## Top lncRNAs (gene level)
+```{r, echo = T}
+
+top_lncRNAs <- res_dte_lnc %>%
+  filter(signif != "Not significant") %>% 
+  rownames_to_column("lncRNAs") %>% 
+  group_by(signif) %>%
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+print(top_lncRNAs)
+
+print(combined_stringtie_ncbi_new_names %>% 
+  filter(type == "transcript") %>% 
+  filter(gene_id %in% c(top_lncRNAs %>% pull(lncRNAs))) %>% 
+  dplyr::select(start, end, strand, gene_id, transcript_id, class_code))
+
+```
+
+## Top Other RNAs (gene level)
+
+```{r, echo = T}
+
+top_RNAs <- res_dte_pc %>%
+  filter(signif != "Not significant") %>% 
+  rownames_to_column("RNAs") %>% 
+  group_by(signif) %>%
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+print(top_RNAs)
+
+print(combined_stringtie_ncbi_new_names %>% 
+  filter(type == "transcript") %>% 
+  filter(gene_id %in% c(top_RNAs %>% pull(RNAs))) %>% 
+  dplyr::select(start, end, strand, gene_id, transcript_id, class_code))
+
+
+rm(dds_lncRNA, dds_pc, res_dte_lnc, res_dte_pc, res_lnc, res_pc, top_lncRNAs, top_RNAs, txi_lnc, txi_pc, txi_gene, lnc_tx, pc_tx)
+```
+
+
+# Differential Trancript expression 
+```{r, echo = T}
+## Separate to lncRNAs and reference
+
+lnc_tx_tx <- combined_stringtie_ncbi_new_names %>% 
+  filter(transcript_biotype == "lncRNA") %>% pull(transcript_id) %>% unique()
+
+pc_tx_tx <- combined_stringtie_ncbi_new_names %>% 
+  filter(transcript_biotype %in% c("mRNA", "rRNA", "tRNA")) %>% pull(transcript_id) %>% unique()
+
+combined_stringtie_ncbi_new_names %>% filter(type == "transcript") %>% 
+  filter(transcript_biotype == "lncRNA") %>% pull(transcript_id) %>% unique() %>% head()
+
+
+txi_lnc_tx <- list(
+  abundance = txi_tx$abundance[rownames(txi_tx$abundance) %in% lnc_tx_tx, ],
+  counts = txi_tx$counts[rownames(txi_tx$counts) %in% lnc_tx_tx, ],
+  length = txi_tx$length[rownames(txi_tx$length) %in% lnc_tx_tx, ],
+  countsFromAbundance = txi_tx$countsFromAbundance
+)
+
+txi_pc_tx <- list(
+  abundance = txi_tx$abundance[rownames(txi_tx$abundance) %in% pc_tx_tx, ],
+  counts = txi_tx$counts[rownames(txi_tx$counts) %in% pc_tx_tx, ],
+  length = txi_tx$length[rownames(txi_tx$length) %in% pc_tx_tx, ],
+  countsFromAbundance = txi_tx$countsFromAbundance
+)
+
+print(paste("Number of lncRNAs (transcript):", nrow(txi_lnc_tx$counts)))
+print(paste("Number of others (transcript):", nrow(txi_pc_tx$counts)))
+
+dds_lncRNA_tx <- DESeqDataSetFromTximport(txi_lnc_tx,
+                                colData = meta,
+                                design = ~ condition)
+
+dds_pc_tx <- DESeqDataSetFromTximport(txi_pc_tx,
+                                       colData = meta,
+                                       design = ~ condition)
+
+
+dds_lncRNA_tx <- DESeq(dds_lncRNA_tx)
+dds_pc_tx  <- DESeq(dds_pc_tx)
+
+resultsNames(dds_lncRNA_tx)
+resultsNames(dds_pc_tx)
+
+
+```
+
+## Results (transcript level)
+```{r, echo = T}
+#res_lnc_tx <- lfcShrink(dds_lncRNA_tx, coef = "condition_Pb18_Pbs_vs_Hapx_Pbs", type = "apeglm")
+#res_pc_tx  <- lfcShrink(dds_pc_tx,  coef = "condition_Pb18_Pbs_vs_Hapx_Pbs", type = "apeglm")
+
+res_lnc_tx <- DESeq2::results(dds_lncRNA_tx, name = "condition_Pb18_Pbs_vs_Hapx_Pbs")
+res_pc_tx  <- DESeq2::results(dds_pc_tx,  name = "condition_Pb18_Pbs_vs_Hapx_Pbs")
+
+# Transformar em dataframe
+res_dte_lnc_tx <- as.data.frame(res_lnc_tx)
+res_dte_pc_tx <- as.data.frame(res_pc_tx)
+
+
+res_dte_sign <- function(res_dte){
+  res_dte %>% 
+  mutate(
+    signif = 
+      case_when(
+        padj < 0.05 & log2FoldChange < 0 ~ "Downregulated",
+        padj < 0.05 & log2FoldChange > 0 ~ "Upregulated",
+        padj >= 0.05 ~ "Not significant"
+      )
+  )
+} 
+
+res_dte_lnc_tx <- res_dte_sign(res_dte_lnc_tx) %>% na.omit()
+res_dte_pc_tx <- res_dte_sign(res_dte_pc_tx) %>% na.omit()
+
+write.csv(res_dte_lnc_tx, file = "./results_salmon/res_dte_lnc_transcript.csv")
+write.csv(res_dte_pc_tx, file = "./results_salmon/res_dte_pc_transcript.csv")
+
+```
+
+## Number of downregulated and upregulated (transcript level)
+```{r, echo = T}
+ggplot(res_dte_lnc_tx %>% filter(signif != "Not significant"), aes(signif)) +
+  geom_bar(aes(fill = signif)) + xlab("") + ylab("Number of lncRNAs (transcript)") + theme_minimal()
+
+ggplot(res_dte_pc_tx %>% filter(signif != "Not significant"), aes(signif)) +
+  geom_bar(aes(fill = signif)) + xlab("") + ylab("Number of other RNAs (transcript)") + theme_minimal()
+
+```
+
+
+
+## Pheatmap (transcript level)
+```{r, echo = T}
+heatm_plot <- function(res_dte, dds_tx){
+  res_dte <- subset(res_dte, padj < 0.05)
+  dgt <- rownames(res_dte)
+  exp_genes_tx <- counts(dds_tx, normalized = TRUE)
+  idx <- rownames(exp_genes_tx) %in% dgt
+  exp_genes_tx <- exp_genes_tx[idx,]
+  exp_dgt_z_score <- t(apply(exp_genes_tx, 1, scale, center = T, scale = T))
+  colnames(exp_dgt_z_score) <- rownames(meta)
+  return(exp_dgt_z_score)
+}
+
+exp_lnc_tx <- heatm_plot(res_dte_lnc_tx, dds_lncRNA_tx)
+exp_pc_tx <- heatm_plot(res_dte_pc_tx, dds_pc_tx)
+
+ann_col <- data.frame(Condition = meta$condition)
+rownames(ann_col) <- meta$sample
+
+# Plotar gráfico
+pheatmap(exp_lnc_tx, show_rownames = F, annotation_col = ann_col, cluster_cols = T)
+grid::grid.text("lncRNAs (transcript)", y = 0.98, x = 0.8, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+
+pheatmap(exp_pc_tx, show_rownames = F, annotation_col = ann_col, cluster_cols = T)
+grid::grid.text("Other RNAs (transcript)", y = 0.98, x = 0.8, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+
+rm(ann_col, exp_lnc_tx, exp_pc_tx, heatm_plot)
+
+```
+
+
+## Volcano (transcript level)
+```{r, echo = T}
+
+EnhancedVolcano::EnhancedVolcano(res_dte_lnc_tx,
+                lab = rownames(res_dte_lnc_tx),
+                x = 'log2FoldChange',
+                y = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 0,
+                pointSize = 2.0,
+                labSize = 3.5,
+                title = 'Volcano Plot - DE lncRNAs',
+                subtitle = 'FDR < 0.05 and |LFC| > 0',
+                caption = "Fonte: DESeq2",
+                legendPosition = 'right', )
+
+
+EnhancedVolcano::EnhancedVolcano(res_dte_pc_tx,
+                                 lab = rownames(res_dte_pc_tx),
+                                 x = 'log2FoldChange',
+                                 y = 'padj',
+                                 pCutoff = 0.05,
+                                 FCcutoff = 0,
+                                 pointSize = 2.0,
+                                 labSize = 3.5,
+                                 title = 'Volcano Plot - DE protein-coding, tRNA, rRNA',
+                                 subtitle = 'FDR < 0.05 and |LFC| > 0',
+                                 caption = "Fonte: DESeq2",
+                                 legendPosition = 'right', )
+
+```
+
+## Top lncRNAs (transcript level)
+```{r, echo = T}
+
+top_lncRNAs_tx <- res_dte_lnc_tx %>%
+  filter(signif != "Not significant") %>% 
+  rownames_to_column("lncRNAs") %>% 
+  group_by(signif) %>%
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+print(top_lncRNAs_tx)
+
+print(combined_stringtie_ncbi_new_names %>% 
+  filter(type == "transcript") %>% 
+  filter(transcript_id %in% c(top_lncRNAs_tx %>% pull(lncRNAs))) %>% 
+  dplyr::select(start, end, strand, gene_id, transcript_id, class_code))
+
+```
+
+## Top Other RNAs (transcript level)
+
+```{r, echo = T}
+
+top_RNAs_tx <- res_dte_pc_tx %>%
+  filter(signif != "Not significant") %>% 
+  rownames_to_column("RNAs") %>% 
+  group_by(signif) %>%
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+print(top_RNAs_tx)
+
+print(combined_stringtie_ncbi_new_names %>% 
+  filter(type == "transcript") %>% 
+  filter(transcript_id %in% c(top_RNAs_tx %>% pull(RNAs))) %>% 
+  dplyr::select(start, end, strand, gene_id, transcript_id, class_code))
+
+```
+
+
+## Exon size
+```{r, echo = T}
+exon_number <- as.data.frame(combined_stringtie_ncbi_new_names %>% filter(type == "exon") %>% 
+  group_by(transcript_id) %>%
+  summarise(num_exons = n()))
+
+exon_number <- merge(exon_number, combined_stringtie_ncbi_new_names %>% filter(type == "transcript") %>% 
+                       dplyr::select(transcript_id, transcript_biotype) %>% 
+                       distinct(), by = "transcript_id", all.x = T)
+
+exon_number <- exon_number %>% filter(transcript_id %in% rownames(txi_tx$counts))
+
+
+# Categories
+exon_number <- exon_number %>%
+  mutate(exon_group = case_when(
+    num_exons == 1 ~ "1",
+    num_exons == 2 ~ "2",
+    num_exons == 3 ~ "3",
+    num_exons == 4 ~ "4",
+    num_exons >= 5 ~ "5+"
+  ))
+
+ggplot(exon_number, aes(x = exon_group)) +
+  geom_bar(fill = "#377EB8") +
+  labs(
+    title = "Number of exons by transcript",
+    x = "Number of exons",
+    y = "Number of transcripts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  ) + facet_wrap(~ transcript_biotype, scales = "free_y")
+
+```
+
+## Mature transcript
+```{r, echo = T}
+sum_exon_transcript <- aggregate(width ~ transcript_id, 
+                                 data = combined_stringtie_ncbi_new_names %>% filter(type == "exon"), FUN = sum)
+sum_exon_transcript <- sum_exon_transcript %>% filter(transcript_id %in% rownames(txi_tx$counts))
+
+
+sum_exon_transcript <- sum_exon_transcript %>%
+  mutate(size_group = case_when(
+    width < 200 ~ "<200",
+    width >= 200 & width <= 500 ~ "200-500",
+    width > 500 & width <= 1000 ~ "501-1000",
+    width > 1000 & width <= 1500 ~ "1001-1500",
+    width > 1500 & width <= 2000 ~ "1501-2000",
+    width > 2000 ~ ">2000"
+  ))
+
+sum_exon_transcript$size_group <- factor(sum_exon_transcript$size_group, 
+                                         levels = c("<200", "200-500", "501-1000", "1001-1500", "1501-2000", ">2000"))
+
+sum_exon_transcript <- merge(sum_exon_transcript, combined_stringtie_ncbi_new_names
+                             %>% filter(type == "transcript") %>% 
+                       dplyr::select(transcript_id, transcript_biotype) %>% distinct(), by = "transcript_id", all.x = T)
+
+
+ggplot(sum_exon_transcript, aes(x = size_group)) +
+  geom_bar(fill = "#377EB8") +
+  labs(
+    title = "Mature transcripts",
+    x = "Size (nucleotides)",
+    y = "Number of transcripts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  ) + facet_wrap(~ transcript_biotype, scales = "free_y") + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Rotaciona os ticks do eixo X em 45 graus
+  )
+
+```
+
+## Complete Transcript
+```{r, echo = T}
+sum_transcript <- combined_stringtie_ncbi_new_names %>% filter(type == "transcript")
+sum_transcript <- sum_transcript %>% filter(transcript_id %in% rownames(txi_tx$counts))
+
+
+sum_transcript <- sum_transcript %>%
+  mutate(size_group = case_when(
+    width < 200 ~ "<200",
+    width >= 200 & width <= 500 ~ "200-500",
+    width > 500 & width <= 1000 ~ "501-1000",
+    width > 1000 & width <= 1500 ~ "1001-1500",
+    width > 1500 & width <= 2000 ~ "1501-2000",
+    width > 2000 ~ ">2000"
+  ))
+
+sum_transcript$size_group <- factor(sum_transcript$size_group, 
+                                         levels = c("<200", "200-500", "501-1000", "1001-1500", "1501-2000", ">2000"))
+
+sum_transcript <- merge(sum_transcript, combined_stringtie_ncbi_new_names %>% filter(type == "transcript") %>% 
+                               dplyr::select(transcript_id, transcript_biotype) %>% distinct(), by = "transcript_id", all.x = T)
+
+
+ggplot(sum_transcript, aes(x = size_group)) +
+  geom_bar(fill = "#377EB8") +
+  labs(
+    title = "Complete transcripts",
+    x = "Size (nucleotides)",
+    y = "Number of transcripts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  ) + facet_wrap(~ transcript_biotype.x, scales = "free_y") + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Rotaciona os ticks do eixo X em 45 graus
+  )
+```
+
